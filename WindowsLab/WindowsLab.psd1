@@ -39,7 +39,6 @@ Key Features:
 - Create and manage generic user accounts
 - Update passwords for generic accounts
 - Disconnect users from all PCs
-- Deploy files to all PCs
 '@
 
 # Minimum version of the PowerShell engine required by this module
@@ -80,10 +79,10 @@ RequiredModules = @(@{ModuleName="NtpTime"; ModuleVersion="1.1"; Guid="7fb3dc99-
 # NestedModules = @()
 
 # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
-FunctionsToExport = @('Stop-LabPc', 'Start-LabPc', 'Set-LabPcName',
+FunctionsToExport = @('Stop-LabPc', 'Start-LabPc', 'Restart-LabPc', 'Set-LabPcName',
                      'Sync-LabPcDate', 'Test-LabPcPrompt',
                     'Disconnect-User', 'New-LabUser', 'Remove-LabUser',
-                    'Set-LabUser', 'Deploy-Item', 'Write-Terminal')
+                    'Set-LabUser')
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
 CmdletsToExport = @()

@@ -9,7 +9,9 @@
 # Get this script name without extension
 $thisModuleName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Path)
 
-# Set path to $HOME\AppData\Roaming\config.json
+# Set path to $HOME\AppData\Roaming\<module name>\config.json
+
+# Create module directory if not exist
 New-Item -Path $env:APPDATA -Name "$thisModuleName" -ItemType Directory -ErrorAction SilentlyContinue
 $configPath = Join-Path -Path $env:APPDATA -ChildPath $thisModuleName 'config.json'
 $selectedIconPath = Join-Path -Path $PSScriptRoot -ChildPath "selectedTab.ico"
@@ -25,7 +27,15 @@ else {
 
 # -- End Init Vars --
 
+# -----------------
+# Private functions
+# -----------------
+
 function Write-Terminal {
+    <#
+    .SYNOPSIS
+        [Private] multicolor line writing to terminal
+    #>
     [CmdletBinding()]
     param (
         [Parameter(Position=0, ValueFromPipeline=$true)]
@@ -114,7 +124,10 @@ function Write-Terminal {
 }
 
 function Test-NoLabPcName {
-    # Test if LabPc names are not set in config.json
+    <#
+    .SYNOPSIS
+        [Private] Test if LabPc names are not set in config.json
+    #>
     param ()
     Write-Terminal -Text "Lab name: $($currentLab.Name)" -ForegroundColor DarkCyan
     Write-Terminal
@@ -125,7 +138,170 @@ function Test-NoLabPcName {
     }
 }
 
-function Set-LabPcName {# the GUI cmdlet
+function Get-LabPcMac {
+    <#
+    .SYNOPSIS
+        [Private] Show info into GUI console about Ethernet PcLab MAC addresses.
+
+    .DESCRIPTION
+        Get-LabPcMac searches for LabPC Ethernet MAC addresses. When
+        a MAC address is found, it is saved to the configuration file.
+        MAC addresses are required for the Start-LabPc cmdlet to use
+        Wake-on-LAN (WoL).
+
+    .NOTES
+        This cmdlet uses Write-Output to send messages to the pipeline,
+        allowing them to be displayed in the GUI console.
+    #>
+
+    Update-Config
+    $foundMacs = @()
+    $currentlab.PcNames | ForEach-Object {
+        try {
+            Write-Output "`n$_"
+            $pcNameLen = $_.Length
+
+            # Search for Physical, connected (Up), ethernet (standard 802.3) adapter
+            $netAdapter = Get-NetAdapter -Physical -CimSession $_ -ErrorAction Stop |
+            Where-Object {
+                $_.Status -eq "Up" -and ($_.PhysicalMediaType -like "*802.3*" -or $_.Name -like "*Ethernet*")
+            } | Select-Object MacAddress
+
+            if ($netAdapter.Length -eq 0) {
+                # Connected, but not via an Ethernet adapter.
+                $foundMacs += $null
+                Write-Output "is not connected via an Ethernet adapter. Please connect.`n$('-' * $pcNameLen)"
+            }
+            elseif ($netAdapter.Length -eq 1) {
+                # Connected via an Ethernet adapter.
+                $foundMacs += $netAdapter.MacAddress
+                Write-Output "$($netAdapter.MacAddress)`n$('-' * $pcNameLen)"
+            }
+            else {
+                # Connected via multiple adapters, including Ethernet.
+                $foundMacs += $null
+                Write-Output "appears to have $($netAdapter.MacAddress.count) Ethernet adapters. Disconnect all but one.`n$('-' * $pcNameLen)"
+            }
+
+        }
+        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
+            # LabPC is unreachable because it is either off, not connected, or not ready.
+            $foundMacs += $null
+            Write-Output "is unreachable because it is either off, not connected, or not ready.`n$('-' * $pcNameLen)"
+        }
+        catch {
+            Write-Output $_.exception.GetType().fullname
+        }
+    }
+
+    $script:currentLab.PcMacs = $foundMacs
+    $script:config.Labs[$config.LastSelectedLab] = $currentLab
+
+    # Save to JSON file
+    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath
+    Write-Output "`n`nAny found MAC addresses have been saved and are available for Start-LabPc cmdlet."
+    if ($foundMacs -contains $null) {
+        Write-Output "`nTo retrieve any missing MAC addresses, resolve the issues above and press again [Get MACs] button."
+    }
+}
+
+function Backup-LabUserDesktop {
+    <#
+    .SYNOPSIS
+        [Private] Backup LabUser desktop into ROOT:\LabPc folder
+
+    .DESCRIPTION
+        This cmdlet copies LabUser desktop files and folders into into ROOT:|LabPc folder and deletes any previous item.
+
+    .EXAMPLE
+        Backup-LabUserDesktop -UserName Alunno
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$True, HelpMessage="Enter LabUser name")]
+        [string]$UserName
+    )
+    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
+        ${function:Write-Terminal} = ${using:function:Write-Terminal}
+        try {
+            # get specified Lab user
+            $localUser = Get-LocalUser -Name $Using:UserName -ErrorAction Stop
+
+            # get Lab user USERPROFILE path
+            $userProfilePath = (Get-CimInstance -Class Win32_UserProfile | Where-Object { $_.SID -eq $localUser.SID.Value }).LocalPath
+            # Test-Path -Path $userProfilePath -ErrorAction Stop | Out-Null
+
+            $userDesktopPath = Join-Path -Path $userprofilePath -ChildPath 'Desktop'
+
+            # create LabPc folder if not exist
+            $labPcPath = Join-Path -Path $env:SystemDrive -ChildPath 'LabPc'
+            New-Item -Path $labPcPath -ItemType "directory" -ErrorAction SilentlyContinue
+
+            # copy labuser desktop
+            Remove-Item -Path $labPcPath -Force -Recurse -ErrorAction SilentlyContinue # delete any previous saved desktop
+            Copy-Item -Path "$userDesktopPath\" -Destination $labPcPath -Recurse -Force
+
+            Write-Terminal -Text "$Using:Username Desktop saved for $env:computername" -ForegroundColor Green
+        }
+        catch [Microsoft.PowerShell.Commands.UserNotFoundException] {
+            Write-Terminal -Text "$Using:UserName @ $env:computername does NOT exist" -ForegroundColor Yellow
+            Write-Terminal -Text "$Using:Username Desktop save failed for $env:computername" -ForegroundColor Red
+        }
+        catch [System.Management.Automation.ParameterBindingException] {
+            # user exist USERPROFILE path no
+            Write-Terminal -Text "$Using:UserName exist but never signed-in on $env:computername" -ForegroundColor Yellow
+            Write-Terminal -Text "$Using:Username Desktop save failed for $env:computername" -ForegroundColor Red
+        }
+    }
+}
+
+function Restore-LabUserDesktop {
+    <#
+    .SYNOPSIS
+        [Private] Restore LabUser desktop backup from ROOT:\LabPc
+
+    .DESCRIPTION
+        This cmdlet copies back the LabUser desktop backup from ROOT:\LabPc folder, overwrite any existing items.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$True, HelpMessage="Enter LabUser name")]
+        [string]$UserName
+    )
+    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
+        ${function:Write-Terminal} = ${using:function:Write-Terminal}
+        try {
+            # get specified Lab user
+            $localUser = Get-LocalUser -Name $Using:UserName -ErrorAction Stop
+
+            # get Lab user USERPROFILE path
+            $userProfilePath = (Get-CimInstance -Class Win32_UserProfile | Where-Object { $_.SID -eq $localUser.SID.Value }).LocalPath
+            Test-Path -Path $userProfilePath -ErrorAction Stop | Out-Null
+
+            $userDesktopPath = Join-Path -Path $userprofilePath -ChildPath 'Desktop'
+
+            # copy lab user desktop back
+            $sourcePath = Join-Path -Path $env:SystemDrive -ChildPath "LabPc"
+            Copy-Item -Path "$sourcePath\*" -Destination $userDesktopPath -Recurse -Force
+
+            Write-Terminal -Text "$Using:Username Desktop restored for $env:computername" -ForegroundColor Green
+        }
+        catch [Microsoft.PowerShell.Commands.UserNotFoundException] {
+            Write-Terminal -Text "$Using:UserName @ $env:computername does NOT exist" -ForegroundColor Yellow
+            Write-Terminal -Text "$Using:Username Desktop restore failed for $env:computername" -ForegroundColor Red
+        }
+        catch [System.Management.Automation.ParameterBindingException] {
+            Write-Terminal -Text "$Using:UserName exist but never signed-in on $env:computername" -ForegroundColor Yellow
+            Write-Terminal -Text "$Using:Username Desktop restore failed for $env:computername" -ForegroundColor Red
+        }
+    }
+}
+
+
+# ----------------
+# Public functions
+# ----------------
+function Set-LabPcName {
     <#
     .SYNOPSIS
         GUI to manage LabPcs names
@@ -439,14 +615,13 @@ function Set-LabPcName {# the GUI cmdlet
     $form.ShowDialog()
 }
 
-
 function Test-LabPcPrompt {
     <#
     .SYNOPSIS
         Tests for each LabPC if the WinRM service is running.
 
     .DESCRIPTION
-        This cmdlet informs you which LabPCs are ready to accept cmdlets from Main computer.
+        This cmdlet shows which LabPCs are ready to accept remote cmdlets.
 
     .EXAMPLE
         Test-LabPcPrompt
@@ -458,10 +633,10 @@ function Test-LabPcPrompt {
     foreach ($pc in $currentlab.PcNames) {
         try {
             Test-WSMan -ComputerName $pc -ErrorAction Stop | Out-Null
-            Write-Terminal -Text "$pc", "ready" -ForegroundColor DarkYellow, Green 
+            Write-Terminal -Text "$pc", "ready" -ForegroundColor DarkYellow, DarkGreen
         }
         catch [System.InvalidOperationException] {
-            Write-Terminal -Text "$pc", "not ready" -ForegroundColor DarkYellow, Red 
+            Write-Terminal -Text "$pc", "off or not ready" -ForegroundColor DarkYellow, DarkRed 
         }
     }
 }
@@ -469,15 +644,14 @@ function Test-LabPcPrompt {
 function Sync-LabPcDate {
     <#
     .SYNOPSIS
-        Sync MasterComputer date with NTP time and then sync each LabPC date
+        Sync Main Computer date with NTP time and then sync each LabPC date
 
         .EXAMPLE
         Sync-LabPcDate
 
     .NOTES
-        The NtpTime module is required on MasterComputer (https://www.powershellgallery.com/packages/NtpTime/1.1)
-
-        Set-Date requires admin privilege to run
+        The NtpTime module is required on Main Computer (https://www.powershellgallery.com/packages/NtpTime/1.1);
+        Set-Date requires admin privilege to run;
     #>
     [CmdletBinding()]
     param ()
@@ -491,111 +665,133 @@ function Sync-LabPcDate {
         Break
     }
 
-    # get datetime from default NTP server
     try {
-        $currentDate = (Get-NtpTime -MaxOffset 60000).NtpTime
-        Write-Terminal -Text "Current NTP time: $currentdate" -ForegroundColor Yellow
-        Write-Terminal
-
-        Set-Date -Date $currentDate | Out-Null
-        Write-Terminal -Text "PCL00", "synced", "(Master PC)" -ForegroundColor DarkYellow, Green, DarkYellow
-
-        $job = Invoke-Command -ComputerName $currentLab.PcNames -AsJob -ScriptBlock {
-            Set-Date -Date $Using:currentDate
-        }
-
-        # Total number of child jobs
-        $total = $job.ChildJobs.Count        
-
-        # Monitor the Job collection
-        while ($job.State -eq 'Running') {
-            $completed = ($job.ChildJobs | Where-Object { $_.State -eq 'Completed' }).Count
-            
-            $percent = ($completed / $total) * 100
-            
-            Write-Progress -Activity "Syncing" `
-                        -Status "$completed of $total computers" `
-                        -PercentComplete $percent
-            
-            Start-Sleep -Milliseconds 500
-        }
-
-        # Cleanup and retrieve output
-        Write-Progress -Activity "Running Remote Tasks" -Completed
-        $results = Receive-Job -Job $job -ErrorAction SilentlyContinue
-        Remove-Job -Job $job
-
-        # Show syncing results
-        foreach ($pc in $currentLab.PcNames) {
-            if ($pc -in $results.PSComputerName) {
-                Write-Terminal -Text "$pc", "synced" -ForegroundColor DarkYellow, Green
-            }
-            else {
-                Write-Terminal -Text "$pc", "not synced" -ForegroundColor DarkYellow, Red
-            }
-        }
+        # get datetime from default NTP server
+        $currentDate = (Get-NtpTime -MaxOffset 60000 -ErrorAction Stop).NtpTime
         
+        Set-Date -Date $currentDate | Out-Null
+        Write-Terminal -Text "Main ", "synced", "with NTP time: $currentDate" -ForegroundColor DarkYellow, DarkGreen, Yellow
+
+        $results = Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
+            # progress line
+            Write-Host "=" -NoNewline -ForegroundColor Yellow
+            Set-Date -Date $Using:currentDate
+            [PSCustomObject]@{
+                ComputerName = $env:COMPUTERNAME
+            }                
+        } -ErrorAction SilentlyContinue
+
+        # delete progress line 
+        $esc = [char]27
+        Write-Host "$($Esc)[1K$($ESC)[G" -NoNewline
+
+        # Show results
+        foreach ($pc in $currentlab.PcNames) {
+            if ($pc -in $results.ComputerName) {
+                Write-Terminal -Text "$pc", "synced" -ForegroundColor DarkYellow, DarkGreen
+            } else {
+                Write-Terminal -Text "$pc", "not synced", "(off or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
+            }
+        }
     }
     catch {
-        Write-Terminal -Text "   Try again later ..."
-    }
+        Write-Terminal "Sync-LabPcdate:", "$($_.Exception.Message)", "(Try again later)" -ForegroundColor DarkYellow, Red, Yellow
+    }        
 }
 
-function Deploy-Item {
+function Start-LabPc {
     <#
     .SYNOPSIS
-        Deploy a file or folder from AdminPC to LabPCs
+        Turn on each computers if WoL setting is present and enabled in BIOS/UEFI
 
-    .DESCRIPTION
-        Copy a file or folder to all LabUser desktops, folders are copied recursively.
+    .EXAMPLE
+        Start-LabPc
+
+    .NOTES
+        https://www.pdq.com/blog/wake-on-lan-wol-magic-packet-powershell/
     #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$True, HelpMessage="Enter Path to file or folder")]
-        [string]$Path,
-        [Parameter(Mandatory=$True, HelpMessage="Enter LabUser name")]
-        [string]$UserName
-    )
+    [CmdletBinding(SupportsShouldProcess)]
+    param ()
 
     Test-NoLabPcName
-    Resolve-Path -Path $Path -ErrorAction Stop | Out-Null
+    Write-Terminal -Text "Remember, Start-LabPc works only if the LabPCs support WoL (Wake-on-LAN)." -ForegroundColor DarkYellow
 
-    $currentlab.PcNames | ForEach-Object -Parallel {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
-        $session = New-PSSession -ComputerName $_
-        $labUserprofilePath = Invoke-Command -Session $session -ScriptBlock {
-            param($UName)
-            ${function:Write-Terminal} = ${using:function:Write-Terminal}
-            try {
-                # LabUser exist?
-                $labUser = Get-LocalUser -Name $UName -ErrorAction Stop
-
-                # LabUser signed-in?
-                $labUserProfilePath = (Get-CimInstance -Class Win32_UserProfile |
-                                    Where-Object { $_.SID -eq $labUser.SID.Value }).LocalPath
-
-                if ($null -eq $labUserProfilePath) {
-                    Write-Terminal -Text "$UName exist but never signed-in on $env:computername" -ForegroundColor Yellow
-                    Write-Terminal -Text "Deployment to $env:computername failed" -ForegroundColor Red
-                }
-            }
-            catch [Microsoft.PowerShell.Commands.UserNotFoundException] {
-                Write-Terminal -Text "$UName NOT exist on $env:computername" -ForegroundColor Yellow
-                Write-Terminal -Text "Deployment to $env:computername failed" -ForegroundColor Red
-                $labUserProfilePath = $null
-            }
-            finally {
-                $labUserProfilePath
-            }
-        } -ArgumentList $using:UserName
-
-        if ($null -ne $labUserprofilePath) {
-            $labUserDesktopPath = Join-Path -Path $labUserprofilePath -ChildPath 'Desktop'
-            Copy-Item -Path $using:Path -Destination $labUserDesktopPath -ToSession $session -Recurse -Force
-            Write-Terminal -Text "Deployment to $_ success" -ForegroundColor Green
+    # Send Magic Packet over LAN
+    for ($i = 0; $i -lt $currentlab.PcNames.Count; $i++) {
+        $PcName = $currentlab.PcNames[$i]
+        $Mac = $currentlab.PcMacs[$i]
+        if ($Mac) {
+            $MacByteArray = $Mac -split "[:-]" | ForEach-Object { [Byte] "0x$_"}
+            [Byte[]] $MagicPacket = (,0xFF * 6) + ($MacByteArray * 16)
+            $UdpClient = New-Object System.Net.Sockets.UdpClient
+            $UdpClient.Connect(([System.Net.IPAddress]::Broadcast),7)
+            $UdpClient.Send($MagicPacket,$MagicPacket.Length) | Out-Null
+            $UdpClient.Close()
+            Write-Terminal -Text $PcName, "Started" -ForegroundColor DarkYellow, Green
         }
-        Remove-PSSession $session
-    } -ThrottleLimit 5
+        else {
+            Write-Terminal -Text $PcName, "is missing MAC Address." -ForegroundColor Red
+            Write-Terminal -Text "(Run Set-LabPcNames and press [Get MACs] button for more information.)" -ForegroundColor Gray
+        }
+    }
+
+}
+
+function Stop-LabPc {
+    <#
+    .SYNOPSIS
+        Force an immediate shut down of each computer
+
+        Stop-LabPc
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    Test-NoLabPcName
+    $results = Invoke-command -ComputerName $currentlab.PcNames -ScriptBlock {
+        Stop-Computer  -ComputerName $env:COMPUTERNAME -Force -ErrorAction SilentlyContinue
+        [PSCustomObject]@{
+            ComputerName = $env:COMPUTERNAME
+        }
+    } -ErrorAction SilentlyContinue
+
+    # Show results
+    foreach ($pc in $currentlab.PcNames) {
+        if ($pc -in $results.ComputerName) {
+            Write-Terminal -Text "$pc", "shutting down" -ForegroundColor DarkYellow, DarkGreen
+        } else {
+            Write-Terminal -Text "$pc", "already off" -ForegroundColor DarkYellow, DarkRed
+        }
+        
+    }    
+}
+
+function Restart-LabPc {
+    <#
+    .SYNOPSIS
+        Force an immediate restart of each computer
+
+        Restart-LabPc
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    Test-NoLabPcName
+    $results = Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
+        Restart-Computer -ComputerName $env:COMPUTERNAME -Force -ErrorAction SilentlyContinue
+        [PSCustomObject]@{
+            ComputerName = $env:COMPUTERNAME
+        }
+    } -ErrorAction SilentlyContinue
+
+    # Show results
+    foreach ($pc in $currentLab.PcNames) {
+        if ($pc -in $results.ComputerName) {
+            Write-Terminal -Text "$pc", "restarting" -ForegroundColor DarkYellow, DarkGreen
+        } else {
+            Write-Terminal -Text "$pc", "is off" -ForegroundColor DarkYellow, DarkRed
+        }   
+    }
 }
 
 function Disconnect-User {
@@ -617,9 +813,10 @@ function Disconnect-User {
     param()
 
     Test-NoLabPcName
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
+    $results = Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
         $ErrorActionPreference = 'Stop' # NOTE: it is valid only for this function scope
+        # progress line
+        Write-Host "=" -NoNewline -ForegroundColor Yellow        
         try {
             # check if quser command exist
             Get-Command -Name quser -ErrorAction Stop | Out-Null
@@ -629,20 +826,56 @@ function Disconnect-User {
             ForEach-Object {
                 # logoff by session ID
                 logoff ($_ -split "\s+")[2]
-                Write-Terminal -Text "User", ($_ -split "\s+")[1], "logged out $($env:COMPUTERNAME)" -ForegroundColor Green
+                # Write-Host -Text "User", ($_ -split "\s+")[1], "logged out $($env:COMPUTERNAME)" -ForegroundColor Green
+                [PSCustomObject]@{
+                    ComputerName = $env:COMPUTERNAME
+                    UserName = ($_ -split "\s+")[1]
+                    quserExisted = $true
+                }
             }
         }
         catch [System.Management.Automation.CommandNotFoundException] {
-            Write-Terminal -Text "Cannot disconnect any user: quser command not found on $env:computername" -ForegroundColor Red
-            Write-Terminal -Text "is it a windows Home edition?"
+            # Write-Host -Text "Cannot disconnect any user: quser command not found on $env:computername" -ForegroundColor Red
+            # Write-Host -Text "is it a windows Home edition?"
+            [PSCustomObject]@{
+                ComputerName = $env:COMPUTERNAME
+                quserExisted = $false
+            }
         }
         catch {
-            Write-Terminal -Text "No user logged in $($env:COMPUTERNAME)" -ForegroundColor Yellow
+            # Write-Host -Text "No user logged in $($env:COMPUTERNAME)" -ForegroundColor Yellow
+            [PSCustomObject]@{
+                ComputerName = $env:COMPUTERNAME
+                UserName = $null
+                quserExisted = $true
+            }
+        }
+    } -ErrorAction SilentlyContinue
+
+    # Delete progress line 
+    $esc = [char]27
+    Write-Host "$($Esc)[1K$($ESC)[G" -NoNewline
+
+    # Show results
+    foreach ($pc in $results) {
+        if ($pc.quserExisted -eq $false) {
+            Write-Terminal "$($pc.ComputerName)", "quser command not found", "(is it a windows Home edition?)" -ForegroundColor DarkYellow, DarkRed, Yellow
+        } else {
+            if ($null -eq $pc.UserName) {
+                Write-Terminal "$($pc.ComputerName)", "no user logged in" -ForegroundColor DarkYellow, yellow
+            } else {
+                Write-Terminal "$($pc.ComputerName)", "$($pc.UserName)", "logged out" -ForegroundColor DarkYellow, Yellow, DarkGreen
+            }
         }
     }
-}
 
-# -- LabUser section --
+    foreach ($pc in $currentlab.PcNames) {
+        if ($pc -notin $results.ComputerName) {
+            Write-Terminal -Text "$pc", "offline", "(off or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
+        }
+    }
+
+}
 
 function New-LabUser {
     <#
@@ -817,482 +1050,5 @@ function Set-LabUser {
         }
         'Set1' {Backup-LabUserDesktop -UserName $UserName} # -BackupDesktop provided
         'Set2' {Restore-LabUserDesktop -UserName $UserName} # -RestoreDesktop provided
-    }
-}
-
-function Backup-LabUserDesktop {
-    <#
-        Back up LabUser desktop into ROOT:\LabPc folder
-
-        This cmdlet copies LabUser desktop files and folders into into ROOT:|LabPc folder and deletes any previous item.
-
-        Backup-LabUserDesktop -UserName Alunno
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$True, HelpMessage="Enter LabUser name")]
-        [string]$UserName
-    )
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
-        try {
-            # get specified Lab user
-            $localUser = Get-LocalUser -Name $Using:UserName -ErrorAction Stop
-
-            # get Lab user USERPROFILE path
-            $userProfilePath = (Get-CimInstance -Class Win32_UserProfile | Where-Object { $_.SID -eq $localUser.SID.Value }).LocalPath
-            # Test-Path -Path $userProfilePath -ErrorAction Stop | Out-Null
-
-            $userDesktopPath = Join-Path -Path $userprofilePath -ChildPath 'Desktop'
-
-            # create LabPc folder if not exist
-            $labPcPath = Join-Path -Path $env:SystemDrive -ChildPath 'LabPc'
-            New-Item -Path $labPcPath -ItemType "directory" -ErrorAction SilentlyContinue
-
-            # copy labuser desktop
-            Remove-Item -Path $labPcPath -Force -Recurse -ErrorAction SilentlyContinue # delete any previous saved desktop
-            Copy-Item -Path "$userDesktopPath\" -Destination $labPcPath -Recurse -Force
-
-            Write-Terminal -Text "$Using:Username Desktop saved for $env:computername" -ForegroundColor Green
-        }
-        catch [Microsoft.PowerShell.Commands.UserNotFoundException] {
-            Write-Terminal -Text "$Using:UserName @ $env:computername does NOT exist" -ForegroundColor Yellow
-            Write-Terminal -Text "$Using:Username Desktop save failed for $env:computername" -ForegroundColor Red
-        }
-        catch [System.Management.Automation.ParameterBindingException] {
-            # user exist USERPROFILE path no
-            Write-Terminal -Text "$Using:UserName exist but never signed-in on $env:computername" -ForegroundColor Yellow
-            Write-Terminal -Text "$Using:Username Desktop save failed for $env:computername" -ForegroundColor Red
-        }
-    }
-}
-
-function Restore-LabUserDesktop {
-    <#
-        Restore LabUser desktop backup from ROOT:\LabPc
-
-        This cmdlet copies back the LabUser desktop backup from ROOT:\LabPc folder, overwrite any existing items.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory=$True, HelpMessage="Enter LabUser name")]
-        [string]$UserName
-    )
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
-        try {
-            # get specified Lab user
-            $localUser = Get-LocalUser -Name $Using:UserName -ErrorAction Stop
-
-            # get Lab user USERPROFILE path
-            $userProfilePath = (Get-CimInstance -Class Win32_UserProfile | Where-Object { $_.SID -eq $localUser.SID.Value }).LocalPath
-            Test-Path -Path $userProfilePath -ErrorAction Stop | Out-Null
-
-            $userDesktopPath = Join-Path -Path $userprofilePath -ChildPath 'Desktop'
-
-            # copy lab user desktop back
-            $sourcePath = Join-Path -Path $env:SystemDrive -ChildPath "LabPc"
-            Copy-Item -Path "$sourcePath\*" -Destination $userDesktopPath -Recurse -Force
-
-            Write-Terminal -Text "$Using:Username Desktop restored for $env:computername" -ForegroundColor Green
-        }
-        catch [Microsoft.PowerShell.Commands.UserNotFoundException] {
-            Write-Terminal -Text "$Using:UserName @ $env:computername does NOT exist" -ForegroundColor Yellow
-            Write-Terminal -Text "$Using:Username Desktop restore failed for $env:computername" -ForegroundColor Red
-        }
-        catch [System.Management.Automation.ParameterBindingException] {
-            Write-Terminal -Text "$Using:UserName exist but never signed-in on $env:computername" -ForegroundColor Yellow
-            Write-Terminal -Text "$Using:Username Desktop restore failed for $env:computername" -ForegroundColor Red
-        }
-    }
-}
-
-
-# -- LabPc section --
-
-function Get-LabPcMac {
-    <#
-    .SYNOPSIS
-        Show info into GUI console about Ethernet PcLab MAC addresses.
-
-    .DESCRIPTION
-        Get-LabPcMac searches for LabPC Ethernet MAC addresses. When
-        a MAC address is found, it is saved to the configuration file.
-        MAC addresses are required for the Start-LabPc cmdlet to use
-        Wake-on-LAN (WoL).
-
-    .NOTES
-        This cmdlet uses Write-Output to send messages to the pipeline,
-        allowing them to be displayed in the GUI console.
-    #>
-
-    Update-Config
-    $foundMacs = @()
-    $currentlab.PcNames | ForEach-Object {
-        try {
-            Write-Output "`n$_"
-            $pcNameLen = $_.Length
-
-            # Search for Physical, connected (Up), ethernet (standard 802.3) adapter
-            $netAdapter = Get-NetAdapter -Physical -CimSession $_ -ErrorAction Stop |
-            Where-Object {
-                $_.Status -eq "Up" -and ($_.PhysicalMediaType -like "*802.3*" -or $_.Name -like "*Ethernet*")
-            } | Select-Object MacAddress
-
-            if ($netAdapter.Length -eq 0) {
-                # Connected, but not via an Ethernet adapter.
-                $foundMacs += $null
-                Write-Output "is not connected via an Ethernet adapter. Please connect.`n$('-' * $pcNameLen)"
-            }
-            elseif ($netAdapter.Length -eq 1) {
-                # Connected via an Ethernet adapter.
-                $foundMacs += $netAdapter.MacAddress
-                Write-Output "$($netAdapter.MacAddress)`n$('-' * $pcNameLen)"
-            }
-            else {
-                # Connected via multiple adapters, including Ethernet.
-                $foundMacs += $null
-                Write-Output "appears to have $($netAdapter.MacAddress.count) Ethernet adapters. Disconnect all but one.`n$('-' * $pcNameLen)"
-            }
-
-        }
-        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-            # LabPC is unreachable because it is either off, not connected, or not ready.
-            $foundMacs += $null
-            Write-Output "is unreachable because it is either off, not connected, or not ready.`n$('-' * $pcNameLen)"
-        }
-        catch {
-            Write-Output $_.exception.GetType().fullname
-        }
-    }
-
-    $script:currentLab.PcMacs = $foundMacs
-    $script:config.Labs[$config.LastSelectedLab] = $currentLab
-
-    # Save to JSON file
-    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath
-    Write-Output "`n`nAny found MAC addresses have been saved and are available for Start-LabPc cmdlet."
-    if ($foundMacs -contains $null) {
-        Write-Output "`nTo retrieve any missing MAC addresses, resolve the issues above and press again [Get MACs] button."
-    }
-}
-
-function Start-LabPc {
-    <#
-    .SYNOPSIS
-        Turn on each computers if WoL setting is present and enabled in BIOS/UEFI
-
-    .EXAMPLE
-        Start-LabPc
-
-    .NOTES
-        https://www.pdq.com/blog/wake-on-lan-wol-magic-packet-powershell/
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param ()
-
-    Test-NoLabPcName
-    Write-Terminal -Text "Remember, Start-LabPc works only if the LabPCs support WoL (Wake-on-LAN)." -ForegroundColor DarkYellow
-
-    # Send Magic Packet over LAN
-    for ($i = 0; $i -lt $currentlab.PcNames.Count; $i++) {
-        $PcName = $currentlab.PcNames[$i]
-        $Mac = $currentlab.PcMacs[$i]
-        if ($Mac) {
-            $MacByteArray = $Mac -split "[:-]" | ForEach-Object { [Byte] "0x$_"}
-            [Byte[]] $MagicPacket = (,0xFF * 6) + ($MacByteArray * 16)
-            $UdpClient = New-Object System.Net.Sockets.UdpClient
-            $UdpClient.Connect(([System.Net.IPAddress]::Broadcast),7)
-            $UdpClient.Send($MagicPacket,$MagicPacket.Length) | Out-Null
-            $UdpClient.Close()
-            Write-Terminal -Text $PcName, "Started" -ForegroundColor DarkYellow, Green
-        }
-        else {
-            Write-Terminal -Text $PcName, "is missing MAC Address." -ForegroundColor Red
-            Write-Terminal -Text "(Run Set-LabPcNames and press [Get MACs] button for more information.)" -ForegroundColor Gray
-        }
-    }
-
-}
-
-function Stop-LabPc {
-    <#
-    .SYNOPSIS
-        Force an immediate shut down of each computer
-
-    .EXAMPLE
-        Stop-LabPc
-
-    .NOTES
-    #>
-    [CmdletBinding(DefaultParameterSetName = 'Set0', SupportsShouldProcess = $true)]
-    param (
-        [Parameter(ParameterSetName = 'Set1')]
-        [switch]$When, # Get scheduled LabPcs daily stops
-
-        [Parameter(ParameterSetName = 'Set2')]
-        [string]$DailyAt, # Schedule a new LabPc daily stop
-
-        [Parameter(ParameterSetName = 'Set3')]
-        [string]$NoMoreAt, # Remove a LabPc daily stop
-
-        [Parameter(ParameterSetName = 'Set4')]
-        [switch]$AndRestart # Restart LabPcs
-    )
-
-    Test-NoLabPcName
-    Rename-TaskPath
-    switch ($PSCmdlet.ParameterSetName) {
-        'Set0' {Stop-Computer -ComputerName $currentlab.PcNames -Force} # no parameter provided
-        'Set1' {Get-LabPcStop} # -When provided
-        'Set2' {New-LabPcStop -DailyTime $DailyAt} # -DailyAt provided
-        'Set3' {Remove-LabPcStop -DailyTime $NoMoreAt} # -NoMoreAt provided
-        'Set4' {Restart-LabPc} # -AndRestart provided
-    }
-}
-
-function Rename-TaskPath {
-    <#
-    This function exists for backward compatibility and will be silently executed
-    for six months (November 15, 2024 - May 15, 2025) during each Stop-LabPc call.
-
-    - Moves the StopThisComputer task to the new folder and deletes the old folder.
-    - If the old folder is not found, no action is taken.
-    - If the old folder is empty, it is deleted.
-    #>
-    param ()
-
-    $oldFolderPath = "\WinLabAdmin\"
-    $newFolderPath = "\WindowsLab\"
-
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-
-        try {
-            # In both cases folder not exist or is empty raise an exception
-            $tasks = Get-ScheduledTask -TaskPath $using:oldFolderPath -ErrorAction Stop
-
-            # Create the new folder by adding and removing a temporary task, the new folder remain
-            $action = New-ScheduledTaskAction -Execute "cmd.exe"
-            $trigger = New-ScheduledTaskTrigger -AtStartup
-            Register-ScheduledTask -TaskName "TempTask" -TaskPath $using:newFolderPath -Action $action -Trigger $trigger -Force
-            Unregister-ScheduledTask -TaskName "TempTask" -TaskPath $using:newFolderPath -Confirm:$false
-
-            # Move tasks from the old folder to the new folder
-            $tasks = Get-ScheduledTask -TaskPath $using:oldFolderPath -ErrorAction SilentlyContinue
-            foreach ($task in $tasks) {
-                Register-ScheduledTask -TaskName $task.TaskName -TaskPath $using:newFolderPath -InputObject $task -Force
-                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $using:oldFolderPath -Confirm:$false
-            }
-        }
-        catch {
-            # Catch exception and do nothing, this avoid display exception to console
-        }
-        finally {# At this point the task folder not exist or is empty
-
-            # Delete the folder if empty, returns error if not exixt
-            & schtasks.exe /DELETE /TN "$using:oldFolderPath".Trim('\') /F 2>&1
-        }
-    } | Out-Null
-}
-
-function Restart-LabPc {
-    <#
-        Force an immediate restart of each computer and wait for them to be on again
-
-        Restart-LabPc
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param()
-    Restart-Computer -ComputerName $currentlab.PcNames -Force
-}
-
-
-function New-LabPcStop {
-    <#
-        Schedule a new LabPC daily stop at given local-time i.e. the
-        task’s execution time will adjust automatically with DST changes.
-
-        This cmdlet creates the StopThisComputer task with the specified stop time as a trigger.
-        If the task already exists, it adds the stop time as an additional trigger.
-
-        New-LabPcStop -DailyTime '14:15'
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param (
-        [Parameter(Mandatory=$True, HelpMessage="Enter the daily stop time")]
-        [string]$DailyTime
-    )
-
-    # -DailyTime parsing
-    try {
-        # Validate the time format
-        if (-not ($DailyTime -match "^\d{1,2}:\d{2}$")) {
-            throw "Invalid time format. Please use HH:mm format (e.g., '09:00')"
-        }
-
-        $hours = [int]($DailyTime.Split(":")[0])
-        $minutes = [int]($DailyTime.Split(":")[1])
-
-        # Validate hours and minutes ranges
-        if (($hours -lt 0 -or $hours -gt 23) -or ($minutes -lt 0 -or $minutes -gt 59)) {
-            throw "Hours must be between 0 and 23 and minutes must be between 0 and 59"
-        }
-
-        # Create a local [DateTime] object based on the provided DailyTime parameter.
-        $dailyTimeObj = Get-Date -Hour $hours -Minute $minutes -Second 0 -Millisecond 0
-    }
-    catch {
-        Write-Terminal -Text "$_" -ForegroundColor Red
-        return $null
-    }
-
-    # Set the trigger
-    $trigger = New-ScheduledTaskTrigger -Daily -At $dailyTimeObj
-
-    # Set the action
-    $action = New-ScheduledTaskAction -Execute 'Powershell' -Argument '-NoProfile -ExecutionPolicy Bypass -Command "& {Stop-Computer -Force}"'
-
-    # Extract the time from DateTime obj as TimeSpan object
-    $givenTimeTrigger = $dailyTimeObj.TimeOfDay
-
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
-
-        # Set principal contex for SYSTEM account to run as a service with the highest privileges
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-        try {
-            # Get scheduled StopThisComputer task if exist
-            $stopThisComputerTask = Get-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -ErrorAction Stop
-        }
-        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-            # Register the task (-TaskPath is the folder)
-            Register-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -Action $using:action -Trigger $using:trigger -Principal $principal | Out-Null
-            Write-Terminal -Text "First stop daily time $using:DailyTime just set on $env:computername" -ForegroundColor Green
-            Write-Terminal -Text " ... and StopThisComputer task set`n"
-            Return $null
-        }
-
-        # Get all time triggers as TimeSpan objects
-        $allTimeTriggers = @()
-        foreach ($trg in $stopThisComputerTask.Triggers) {
-            $allTimeTriggers += ([datetime] $trg.StartBoundary).TimeOfDay
-        }
-
-        # Check if the new time trigger is already present
-        if ($using:givenTimeTrigger -in $allTimeTriggers) {
-            Write-Terminal -Text "A stop at daily time $using:DailyTime already exist on $env:computername" -ForegroundColor Red
-        } else {
-            # Add the new stop time
-            $stopThisComputerTask.Triggers += $using:trigger
-            Set-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -Trigger $stopThisComputerTask.Triggers -Principal $principal | Out-Null
-            Write-Terminal -Text "A stop at daily time $using:DailyTime added to $env:computername" -ForegroundColor Green
-        }
-    }
-}
-
-function Get-LabPcStop {
-    <#
-        Gets LabPC daily stops
-
-        This cmdlet gets all trigger times for StopThisComputer scheduled task
-
-        Get-LabPcStop
-    #>
-    [CmdletBinding()]
-    param ()
-
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
-
-        $formattedTime = "${env:COMPUTERNAME} stop(s):`n  "
-        try {
-            # Get scheduled StopThisComputer task if exist
-            $stopThisComputerTask = Get-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -ErrorAction Stop
-        }
-        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-            # $_.exception.GetType().fullname
-            $formattedTime += "None"
-            Write-Terminal -Text $formattedTime
-            Return $null
-        }
-
-        # Get all time triggers as TimeSpan objects
-        $allTimeTriggers = @()
-        foreach ($trg in $stopThisComputerTask.Triggers) {
-            $allTimeTriggers += ([datetime] $trg.StartBoundary).TimeOfDay
-        }
-
-        # Print the array in "hh:mm" format
-        foreach ($timeSpan in $allTimeTriggers) {
-            $formattedTime += "{0:hh\:mm\,\ }" -f $timeSpan
-        }
-        $formattedTime = $formattedTime.Substring(0, $formattedTime.Length - 2)
-        Write-Terminal -Text $formattedTime, "(local time)"
-    }
-}
-
-function Remove-LabPcStop {
-    <#
-        Removes a LabPC daily stop
-
-        This cmdlet removes if exist the trigger from StopThisComputer scheduled task with time -DailyTime
-
-        Remove-LabPcStop -DailyTime '14:14'
-    #>
-    [CmdletBinding(SupportsShouldProcess)]
-    param (
-        [Parameter(Mandatory=$True, HelpMessage="Enter daily stop time to remove")]
-        [string]$DailyTime
-    )
-
-    # Time parameter parsing
-    try {
-        $dailyTimeObj = [DateTime]::ParseExact($DailyTime, "HH:mm", [System.Globalization.CultureInfo]::InvariantCulture)
-    }
-    catch {
-        Write-Error "-DailyTime $DailyTime must be in HH:mm format"
-        return $null
-    }
-
-    # Extract the time from DateTime obj as TimeSpan object
-    $givenTimeTrigger = $dailyTimeObj.TimeOfDay
-
-    Invoke-Command -ComputerName $currentLab.PcNames -ScriptBlock {
-        ${function:Write-Terminal} = ${using:function:Write-Terminal}
-
-        try {
-            # Get scheduled StopThisComputer task if exist
-            $stopThisComputerTask = Get-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -ErrorAction Stop
-        }
-        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-            # $_.exception.GetType().fullname
-            Write-Terminal -Text "Stop daily time $Using:DailyTime not exist on $env:computername" -ForegroundColor Red
-            Return $null
-        }
-
-        # Set principal contex for SYSTEM account to run as a service with with the highest privileges
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-        # Remove the given time trigger
-        $allTriggersButTheGiven = @()
-        foreach ($trg in $stopThisComputerTask.Triggers) {
-            if (([datetime] $trg.StartBoundary).TimeOfDay -ne $Using:givenTimeTrigger) {
-                $allTriggersButTheGiven += $trg
-            }
-        }
-
-        if ($allTriggersButTheGiven.Count -eq 0) {
-            Unregister-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -Confirm:$false
-            Write-Terminal -Text "Last Stop daily time $Using:DailyTime removed on $env:computername" -ForegroundColor Green
-            Write-Terminal -Text " ... and StopThisComputer Task deleted`n"
-        }
-        elseif ($allTriggersButTheGiven.count -lt $stopThisComputerTask.Triggers.count) {
-            Set-ScheduledTask -TaskName:'StopThisComputer' -TaskPath:'\WindowsLab\' -Trigger $allTriggersButTheGiven -Principal $principal | Out-Null
-            Write-Terminal -Text "Stop daily time $Using:DailyTime removed on $env:computername" -ForegroundColor Green
-        } else {
-            Write-Terminal -Text "Stop daily time $Using:DailyTime not exist on $env:computername" -ForegroundColor Red
-        }
-
     }
 }
