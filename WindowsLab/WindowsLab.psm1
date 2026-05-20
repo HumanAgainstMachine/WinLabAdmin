@@ -433,7 +433,7 @@ function Test-LabPcPrompt {
             Write-Terminal -Text "$pc", "ready" -ForegroundColor DarkYellow, DarkGreen
         }
         catch [System.InvalidOperationException] {
-            Write-Terminal -Text "$pc", "off or not ready" -ForegroundColor DarkYellow, DarkRed 
+            Write-Terminal -Text "$pc", "unreachable", "(off, disconnected, or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
         }
     }
 }
@@ -611,7 +611,7 @@ function Disconnect-User {
 
     Test-Lab
     $results = Invoke-Command -ComputerName $selectedLab.PcNames -ScriptBlock {
-        $ErrorActionPreference = 'Stop' # NOTE: it is valid only for this function scope
+        $ErrorActionPreference = 'Stop' # NOTE: function scope valid
         # progress line
         Write-Host "=" -NoNewline -ForegroundColor Yellow        
         try {
@@ -623,7 +623,6 @@ function Disconnect-User {
             ForEach-Object {
                 # logoff by session ID
                 logoff ($_ -split "\s+")[2]
-                # Write-Host -Text "User", ($_ -split "\s+")[1], "logged out $($env:COMPUTERNAME)" -ForegroundColor Green
                 [PSCustomObject]@{
                     ComputerName = $env:COMPUTERNAME
                     UserName = ($_ -split "\s+")[1]
@@ -632,15 +631,12 @@ function Disconnect-User {
             }
         }
         catch [System.Management.Automation.CommandNotFoundException] {
-            # Write-Host -Text "Cannot disconnect any user: quser command not found on $env:computername" -ForegroundColor Red
-            # Write-Host -Text "is it a windows Home edition?"
             [PSCustomObject]@{
                 ComputerName = $env:COMPUTERNAME
                 quserExisted = $false
             }
         }
         catch {
-            # Write-Host -Text "No user logged in $($env:COMPUTERNAME)" -ForegroundColor Yellow
             [PSCustomObject]@{
                 ComputerName = $env:COMPUTERNAME
                 UserName = $null
@@ -668,7 +664,7 @@ function Disconnect-User {
 
     foreach ($pc in $selectedLab.PcNames) {
         if ($pc -notin $results.ComputerName) {
-            Write-Terminal -Text "$pc", "offline", "(off or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
+            Write-Terminal -Text "$pc", "unreachable", "(off, disconnected, or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
         }
     }
 
@@ -870,35 +866,35 @@ function Get-LabMac {
     $selectedLab = $script:selectedLab
 
     $foundMacs = @()
-    $selectedLab.PcNames | ForEach-Object {
+    foreach ($pcName in $selectedLab.PcNames) {
         try {
             # Search for Physical, connected (Up), ethernet (standard 802.3) adapter
-            $netAdapter = Get-NetAdapter -Physical -CimSession $_ -ErrorAction Stop |
+            $netAdapter = Get-NetAdapter -Physical -CimSession $pcName -ErrorAction Stop |
             Where-Object {
                 $_.Status -eq "Up" -and ($_.PhysicalMediaType -like "*802.3*" -or $_.Name -like "*Ethernet*")
             } | Select-Object MacAddress
 
             if ($netAdapter.Length -eq 0) {
-                # Connected, but not via an Ethernet adapter.
+                # LabPc connected, but not via an Ethernet adapter.
                 $foundMacs += $null
-                Write-Terminal "$_", "not connected via an Ethernet adapter." -ForegroundColor DarkYellow, DarkRed
+                Write-Terminal "$pcName", "not connected via an Ethernet adapter." -ForegroundColor DarkYellow, DarkRed
             }
             elseif ($netAdapter.Length -eq 1) {
-                # Connected via an Ethernet adapter.
+                # LabPc connected via an Ethernet adapter.
                 $foundMacs += $netAdapter.MacAddress
-                Write-Terminal "$_", "$($netAdapter.MacAddress)" -ForegroundColor DarkYellow, DarkGreen
+                Write-Terminal "$pcName", "$($netAdapter.MacAddress)" -ForegroundColor DarkYellow, DarkGreen
             }
             else {
-                # Connected via multiple adapters, including Ethernet.
+                # LabPc connected via multiple adapters, including Ethernet.
                 $foundMacs += $null
-                Write-Terminal "$_", "connected via multiple adapters, including Ethernet." -ForegroundColor DarkYellow, DarkRed
+                Write-Terminal "$pcName", "connected via multiple adapters, including Ethernet." -ForegroundColor DarkYellow, DarkRed
             }
 
         }
         catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-            # LabPC is unreachable because it is either off, not connected, or not ready.
+            # LabPC unreachable, either off, disconnected, or not ready.
             $foundMacs += $null
-            Write-Terminal "$_", "unreachable (off, disconnected, or not ready)" -ForegroundColor DarkYellow, DarkRed
+            Write-Terminal "$pcName", "unreachable", "(off, disconnected, or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
         }
         catch {
             Write-Terminal $_.exception.GetType().fullname
