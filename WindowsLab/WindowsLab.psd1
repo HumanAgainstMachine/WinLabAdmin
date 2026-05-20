@@ -79,10 +79,10 @@ RequiredModules = @(@{ModuleName="NtpTime"; ModuleVersion="1.1"; Guid="7fb3dc99-
 # NestedModules = @()
 
 # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
-FunctionsToExport = @('Stop-LabPc', 'Start-LabPc', 'Restart-LabPc', 'Set-LabPcName',
+FunctionsToExport = @('Stop-LabPc', 'Start-LabPc', 'Restart-LabPc',
                      'Sync-LabPcDate', 'Test-LabPcPrompt',
                     'Disconnect-User', 'New-LabUser', 'Remove-LabUser',
-                    'Set-LabUser')
+                    'Set-LabUser', 'Show-Lab', 'Show-LabPc', 'Select-Lab', 'New-Lab', 'Remove-Lab','Get-LabMac')
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
 CmdletsToExport = @()
@@ -189,4 +189,3 @@ Initial Release
 # DefaultCommandPrefix = ''
 
 }
-
