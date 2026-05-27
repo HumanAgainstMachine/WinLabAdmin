@@ -15,7 +15,7 @@ $thisModuleName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.My
 New-Item -Path $env:APPDATA -Name "$thisModuleName" -ItemType Directory -ErrorAction SilentlyContinue
 
 # Set path to $HOME\AppData\Roaming\<module name>\config.json
-$configPath = Join-Path -Path $env:APPDATA -ChildPath $thisModuleName 'config.json'
+$configPath = Join-Path -Path $env:APPDATA -ChildPath $thisModuleName 'new_config.json'
 
 if (Test-Path -Path $configPath -PathType Leaf) {
     # Import config.json
@@ -121,8 +121,8 @@ function Write-Terminal {
         $prefix = if ($NoWrap) { "$esc[?7l" } else { "" }
         $suffix = if ($NoWrap) { "$esc[?7h" } else { "" }
 
-        # Print final string with padding
-        Write-Host "${prefix}${padding}${outputString}${suffix}"
+        # Print final string
+        Write-Host "${prefix}${outputString}${suffix}"
     }
 }
 
@@ -410,6 +410,74 @@ function Remove-Lab {
         # Update config JSON file (persistent memory)
         $script:config | ConvertTo-Json -Depth 3 | Set-Content -Path $configPath -Encoding UTF8           
     }   
+}
+
+function Get-LabMac {
+    <#
+    .SYNOPSIS
+        Get Ethernet adapter MAC address for each LabPC
+
+    .DESCRIPTION
+        Get-LabMac searches for MAC addresses, when a MAC address is 
+        found, it is saved to the configuration file.
+
+    .NOTES
+        MAC addresses are required for the Start-LabPc cmdlet to use
+        Wake-on-LAN (WoL).        
+    #>
+    [CmdletBinding()]
+    param ()
+
+    Test-Lab
+    $selectedLab = $script:selectedLab
+
+    $foundMacs = @()
+    foreach ($pcName in $selectedLab.PcNames) {
+        try {
+            # Search for Physical, connected (Up), ethernet (standard 802.3) adapter
+            $netAdapter = Get-NetAdapter -Physical -CimSession $pcName -ErrorAction Stop |
+            Where-Object {
+                $_.Status -eq "Up" -and ($_.PhysicalMediaType -like "*802.3*" -or $_.Name -like "*Ethernet*")
+            } | Select-Object MacAddress
+
+            if ($netAdapter.Length -eq 0) {
+                # LabPc connected, but not via an Ethernet adapter.
+                $foundMacs += $null
+                Write-Terminal "$pcName", "not connected via an Ethernet adapter." -ForegroundColor DarkYellow, DarkRed
+            }
+            elseif ($netAdapter.Length -eq 1) {
+                # LabPc connected via an Ethernet adapter.
+                $foundMacs += $netAdapter.MacAddress
+                Write-Terminal "$pcName", "$($netAdapter.MacAddress)" -ForegroundColor DarkYellow, DarkGreen
+            }
+            else {
+                # LabPc connected via multiple adapters, including Ethernet.
+                $foundMacs += $null
+                Write-Terminal "$pcName", "connected via multiple adapters, including Ethernet." -ForegroundColor DarkYellow, DarkRed
+            }
+
+        }
+        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
+            # LabPC unreachable, either off, disconnected, or not ready.
+            $foundMacs += $null
+            Write-Terminal "$pcName", "unreachable", "(off, disconnected, or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
+        }
+        catch {
+            Write-Terminal $_.exception.GetType().fullname
+        }
+    }
+    # Update module vars (non-persistent memory)
+    $script:selectedLab.PcMacs = $foundMacs
+    $script:config.Labs[$script:config.SelectedLab] = $selectedLab
+
+    # Update config JSON file (persistent memory)
+    $script:config | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath
+    Write-Terminal "Any found MAC addresses have been saved and are available for Start-LabPc cmdlet." -ForegroundColor DarkYellow
+
+    if ($foundMacs -contains $null) {
+        Write-Terminal "To retrieve any missing MAC addresses, resolve the issues above and relaunch Get-LabMac" -ForegroundColor DarkYellow
+    }    
+   
 }
 
 function Test-LabPcPrompt {
@@ -844,72 +912,4 @@ function Set-LabUser {
         'Set1' {Backup-LabUserDesktop -UserName $UserName} # -BackupDesktop provided
         'Set2' {Restore-LabUserDesktop -UserName $UserName} # -RestoreDesktop provided
     }
-}
-
-function Get-LabMac {
-    <#
-    .SYNOPSIS
-        Get Ethernet adapter MAC address for each LabPC
-
-    .DESCRIPTION
-        Get-LabMac searches for MAC addresses, when a MAC address is 
-        found, it is saved to the configuration file.
-
-    .NOTES
-        MAC addresses are required for the Start-LabPc cmdlet to use
-        Wake-on-LAN (WoL).        
-    #>
-    [CmdletBinding()]
-    param ()
-
-    Test-Lab
-    $selectedLab = $script:selectedLab
-
-    $foundMacs = @()
-    foreach ($pcName in $selectedLab.PcNames) {
-        try {
-            # Search for Physical, connected (Up), ethernet (standard 802.3) adapter
-            $netAdapter = Get-NetAdapter -Physical -CimSession $pcName -ErrorAction Stop |
-            Where-Object {
-                $_.Status -eq "Up" -and ($_.PhysicalMediaType -like "*802.3*" -or $_.Name -like "*Ethernet*")
-            } | Select-Object MacAddress
-
-            if ($netAdapter.Length -eq 0) {
-                # LabPc connected, but not via an Ethernet adapter.
-                $foundMacs += $null
-                Write-Terminal "$pcName", "not connected via an Ethernet adapter." -ForegroundColor DarkYellow, DarkRed
-            }
-            elseif ($netAdapter.Length -eq 1) {
-                # LabPc connected via an Ethernet adapter.
-                $foundMacs += $netAdapter.MacAddress
-                Write-Terminal "$pcName", "$($netAdapter.MacAddress)" -ForegroundColor DarkYellow, DarkGreen
-            }
-            else {
-                # LabPc connected via multiple adapters, including Ethernet.
-                $foundMacs += $null
-                Write-Terminal "$pcName", "connected via multiple adapters, including Ethernet." -ForegroundColor DarkYellow, DarkRed
-            }
-
-        }
-        catch [Microsoft.PowerShell.Cmdletization.Cim.CimJobException] {
-            # LabPC unreachable, either off, disconnected, or not ready.
-            $foundMacs += $null
-            Write-Terminal "$pcName", "unreachable", "(off, disconnected, or not ready)" -ForegroundColor DarkYellow, DarkRed, Yellow
-        }
-        catch {
-            Write-Terminal $_.exception.GetType().fullname
-        }
-    }
-    # Update module vars (non-persistent memory)
-    $script:selectedLab.PcMacs = $foundMacs
-    $script:config.Labs[$config.SelectedLab] = $selectedLab
-
-    # Update config JSON file (persistent memory)
-    $config | ConvertTo-Json -Depth 10 | Set-Content -Path $configPath
-    Write-Terminal "Any found MAC addresses have been saved and are available for Start-LabPc cmdlet." -ForegroundColor DarkYellow
-
-    if ($foundMacs -contains $null) {
-        Write-Terminal "To retrieve any missing MAC addresses, resolve the issues above and relaunch Get-LabMac" -ForegroundColor DarkYellow
-    }    
-   
 }
